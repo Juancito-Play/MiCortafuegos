@@ -28,8 +28,8 @@ android {
         applicationId "com.personal.cortafuegos"
         minSdk 24
         targetSdk 34
-        versionCode 2
-        versionName "1.1"
+        versionCode 3
+        versionName "1.2"
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
@@ -77,8 +77,10 @@ import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.graphics.Color
 import android.graphics.drawable.Drawable
+import android.net.Uri
 import android.net.VpnService
 import android.os.Bundle
+import android.provider.Settings
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.Gravity
@@ -108,7 +110,6 @@ class MainActivity : AppCompatActivity() {
             setPadding(24, 20, 24, 16)
         }
 
-        // 1. Barra de búsqueda
         val searchInput = EditText(this).apply {
             hint = "🔍 Buscar aplicación..."
             isSingleLine = true
@@ -119,15 +120,21 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.WRAP_CONTENT
         ))
 
-        // 2. Filtro rápido para ver solo las bloqueadas (OFF)
         val filterCheckBox = CheckBox(this).apply {
             text = "Mostrar solo apps sin internet (OFF)"
             textSize = 15f
-            setPadding(8, 16, 8, 16)
+            setPadding(8, 16, 8, 8)
         }
         root.addView(filterCheckBox)
 
-        // 3. Contador de resumen
+        val tipText = TextView(this).apply {
+            text = "💡 Tip: Para que en WhatsApp salga 1 solo check (como teléfono apagado), ponla en OFF y toca 'Detener' para cerrarla por completo."
+            textSize = 12f
+            setTextColor(Color.parseColor("#E65100"))
+            setPadding(12, 4, 12, 12)
+        }
+        root.addView(tipText)
+
         countText = TextView(this).apply {
             textSize = 13f
             setTextColor(Color.GRAY)
@@ -135,7 +142,6 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(countText)
 
-        // 4. Lista de aplicaciones
         val listView = ListView(this)
         root.addView(listView, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -153,19 +159,33 @@ class MainActivity : AppCompatActivity() {
                 val row = LinearLayout(this@MainActivity).apply {
                     orientation = LinearLayout.HORIZONTAL
                     gravity = Gravity.CENTER_VERTICAL
-                    setPadding(12, 20, 12, 20)
+                    setPadding(12, 16, 12, 16)
                 }
                 val item = filteredAppsList[position]
 
                 val iconView = ImageView(this@MainActivity).apply {
                     setImageDrawable(item.icon)
-                    layoutParams = LinearLayout.LayoutParams(100, 100).apply { rightMargin = 28 }
+                    layoutParams = LinearLayout.LayoutParams(95, 95).apply { rightMargin = 24 }
                 }
                 val nameView = TextView(this@MainActivity).apply {
                     text = item.name
-                    textSize = 16f
+                    textSize = 15f
                     layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
                 }
+
+                // Botón para abrir ajustes de la app y forzar detención si está en OFF
+                val stopBtn = Button(this@MainActivity).apply {
+                    text = "Detener"
+                    textSize = 11f
+                    visibility = if (!item.internetEnabled) View.VISIBLE else View.GONE
+                    setOnClickListener {
+                        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                            data = Uri.fromParts("package", item.packageName, null)
+                        }
+                        startActivity(intent)
+                    }
+                }
+
                 val toggle = Switch(this@MainActivity).apply {
                     setOnCheckedChangeListener(null)
                     isChecked = item.internetEnabled
@@ -181,13 +201,13 @@ class MainActivity : AppCompatActivity() {
                 }
                 row.addView(iconView)
                 row.addView(nameView)
+                row.addView(stopBtn)
                 row.addView(toggle)
                 return row
             }
         }
         listView.adapter = adapter
 
-        // Eventos del buscador y del filtro
         searchInput.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
@@ -224,7 +244,6 @@ class MainActivity : AppCompatActivity() {
                 allAppsList.add(AppItem(label, app.packageName, icon, !isBlocked))
             }
         }
-        // Ordena poniendo primero las que están en OFF (bloqueadas) y luego por orden alfabético
         allAppsList.sortWith(compareBy<AppItem> { it.internetEnabled }.thenBy { it.name.lowercase() })
     }
 
@@ -253,7 +272,7 @@ class MainActivity : AppCompatActivity() {
     private fun saveBlockedState(pkg: String, blocked: Boolean) {
         val set = getBlockedSet()
         if (blocked) set.add(pkg) else set.remove(pkg)
-        prefs.edit().putStringSet("blocked_packages", set).apply()
+        prefs.edit().putStringSet("blocked_packages", set).commit()
     }
 
     private fun applyFirewallRules() {
@@ -281,9 +300,13 @@ import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
+import android.system.OsConstants
+import java.io.FileInputStream
 
 class FirewallVpnService : VpnService() {
     private var vpnInterface: ParcelFileDescriptor? = null
+    @Volatile private var isRunning = false
+    private var workerThread: Thread? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         restartVpn()
@@ -291,8 +314,7 @@ class FirewallVpnService : VpnService() {
     }
 
     private fun restartVpn() {
-        try { vpnInterface?.close() } catch (_: Exception) {}
-        vpnInterface = null
+        stopVpnThread()
 
         val prefs = getSharedPreferences("firewall_prefs", Context.MODE_PRIVATE)
         val blocked = prefs.getStringSet("blocked_packages", emptySet()) ?: emptySet()
@@ -304,20 +326,52 @@ class FirewallVpnService : VpnService() {
 
         val builder = Builder()
             .setSession("CortafuegosPersonal")
+            // Bloqueo IPv4
             .addAddress("10.1.10.1", 32)
             .addRoute("0.0.0.0", 0)
+            .addDnsServer("10.1.10.2")
+            // Bloqueo IPv6 (Clave para datos móviles y Wi-Fi modernos)
+            .addAddress("fd00:1:fd00:1:fd00:1:fd00:1", 128)
             .addRoute("::", 0)
+            .addDnsServer("fd00:1:fd00:1:fd00:1:fd00:2")
+            .allowFamily(OsConstants.AF_INET)
+            .allowFamily(OsConstants.AF_INET6)
+            .setBlocking(true)
 
         for (pkg in blocked) {
             try { builder.addAllowedApplication(pkg) } catch (_: Exception) {}
         }
 
         vpnInterface = builder.establish()
+
+        // Hilo "Agujero Negro": lee y destruye todos los paquetes para que nada salga ni entre
+        vpnInterface?.let { vpn ->
+            isRunning = true
+            workerThread = Thread {
+                val input = FileInputStream(vpn.fileDescriptor)
+                val buffer = ByteArray(32767)
+                while (isRunning) {
+                    try {
+                        val length = input.read(buffer)
+                        if (length <= 0) Thread.sleep(50)
+                    } catch (_: Exception) {
+                        break
+                    }
+                }
+            }.apply { start() }
+        }
+    }
+
+    private fun stopVpnThread() {
+        isRunning = false
+        try { vpnInterface?.close() } catch (_: Exception) {}
+        vpnInterface = null
+        try { workerThread?.interrupt() } catch (_: Exception) {}
+        workerThread = null
     }
 
     override fun onDestroy() {
-        try { vpnInterface?.close() } catch (_: Exception) {}
-        vpnInterface = null
+        stopVpnThread()
         super.onDestroy()
     }
 }
@@ -330,4 +384,4 @@ for path, content in files.items():
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
 
-print("Archivos del proyecto actualizados con buscador y filtro.")
+print("Archivos actualizados con bloqueo IPv6 y drenaje de paquetes.")
